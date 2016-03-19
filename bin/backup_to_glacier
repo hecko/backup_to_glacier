@@ -1,0 +1,98 @@
+#!/usr/bin/python
+
+import os
+import sys
+import time
+import boto3
+import errno
+import argparse
+import subprocess
+from pprint import pprint
+from shutil import copyfile, rmtree, make_archive
+
+parser = argparse.ArgumentParser(description='AWS Glacier backup script')
+parser.add_argument('-b', '--backup_dirs', action='store', nargs="+", required=True, help="List of dirs to back up (recursively)")
+parser.add_argument('-g', '--glacier_go', action='store_true', default=False, help="Yes, do Glacier upload, otherwise only backup")
+parser.add_argument('-m', '--max_age', action='store', type=int, default=24, help="Max age of file in hours to back up")
+parser.add_argument('-v', '--verbose', action='store_true', help="Be verbose")
+args = parser.parse_args()
+
+temp_dir = "/tmp/backup"
+
+def mkdir_p(path):
+    try:
+        os.makedirs(path)
+    except OSError as exc:
+        if exc.errno == errno.EEXIST and os.path.isdir(path):
+            pass
+        else:
+            raise
+
+def walkdir(dirname):
+    backup_this = []
+    for dirpath, dirsnames, filenames in os.walk(dirname):
+        for f in filenames:
+            if os.path.isfile(os.path.join(dirpath, f)):
+                mtime_ago = time.time() - os.path.getmtime(os.path.join(dirpath, f))
+                if args.verbose:
+                    print("Last modified ago (h): " + str(mtime_ago / 60 / 60))
+                if mtime_ago / 60 / 60 < args.max_age:
+                    print("B " + os.path.join(dirpath, f))
+                    backup_this.append((os.path.abspath(dirpath), f))
+                else:
+                    if args.verbose:
+                        print("S too old " + os.path.join(dirpath, f))
+            else:
+                if args.verbose:
+                    print("S " + os.path.join(dirpath, f))
+    return backup_this
+
+
+for this_dir in args.backup_dirs:
+    backup_files = walkdir(this_dir)
+
+#if backup_files:
+#    print("Will backup these files:")
+#    pprint(backup_files)
+
+print("Deleting temp dir: " + temp_dir)
+rmtree(temp_dir)
+
+print("Copying " + str(len(backup_files)) + " files to temp dir...")
+for (dirpath, f) in backup_files:
+    mkdir_p(temp_dir + '/' + dirpath)
+    dest = temp_dir + '/' + dirpath + '/' + f
+    copyfile(os.path.join(dirpath, f), dest)
+
+print("Making archive from files in temp dir")
+archive_f = make_archive('/tmp/'+str(time.time()), 'bztar', temp_dir)
+print(archive_f + " size: " + str(round(os.path.getsize(archive_f) / 1024.0 / 1024.0, 1)) + " MB")
+
+print("Deleting temp dir: " + temp_dir)
+rmtree(temp_dir)
+
+if not args.glacier_go:
+    print("Only backup, no sync to Glacier")
+    sys.exit(0)
+
+print("Uploading files to Glacier...")
+glacier = boto3.resource('glacier')
+vault = glacier.Vault('363510773851', 'test')
+print("Last inventory: " + vault.last_inventory_date)
+print("Size in MB: " + str(vault.size_in_bytes / 1024.0 / 1024.0))
+
+c = boto3.client('glacier')
+print("Backing up " + str(archive_f))
+response = c.upload_archive(
+    vaultName='test',
+    archiveDescription=archive_f,
+    body=open(archive_f, "rb")
+)
+if response['archiveId']:
+    print("Saved as " + str(response['archiveId']))
+    open("glacier_upload.log", "a").write(archive_f + " " + response['archiveId'] + "\n")
+    print("Deleting local copy of archive...")
+    os.unlink(archive_f)
+    print("Done")
+else:
+    print("Error uploading to glacier!?")
